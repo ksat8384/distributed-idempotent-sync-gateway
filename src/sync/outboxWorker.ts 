@@ -1,0 +1,120 @@
+import { Pool } from 'pg';
+
+export interface OutboxRecord {
+  id: string;
+  aggregate_id: string;
+  event_type: string;
+  payload: Record<string, unknown>;
+  retry_count: number;
+  created_at: string;
+}
+
+export interface EventPublisher {
+  publish(topic: string, key: string, message: unknown): Promise<void>;
+}
+
+const MAX_RETRIES = 5;
+const BATCH_SIZE = 50;
+const BASE_BACKOFF_MS = 500;
+
+/**
+ * Transactional Outbox Relay Worker
+ *
+ * Guarantees reliable at-least-once event delivery from PostgreSQL to downstream
+ * event brokers (Kafka / EventBridge / Redis Streams) without dual-write data loss.
+ *
+ * Key Distributed Systems Guarantees:
+ * 1. Multi-Pod Concurrency Safety: Uses `FOR UPDATE SKIP LOCKED` so horizontally scaled
+ *    worker pods claim disjoint batches without blocking or double-publishing.
+ * 2. Backpressure & Jitter: Applies capped exponential backoff with full jitter on broker failures.
+ * 3. Poison-Pill Isolation: Routes permanently failing events to a Dead-Letter status after MAX_RETRIES.
+ */
+export class OutboxWorker {
+  private isRunning = false;
+
+  constructor(
+    private readonly db: Pool,
+    private readonly publisher: EventPublisher,
+    private readonly pollIntervalMs = 1000
+  ) {}
+
+  public start(): void {
+    if (this.isRunning) return;
+    this.isRunning = true;
+    this.pollLoop();
+  }
+
+  public stop(): void {
+    this.isRunning = false;
+  }
+
+  private async pollLoop(): Promise<void> {
+    while (this.isRunning) {
+      try {
+        const processedCount = await this.processBatch();
+        // Drain immediately if a full batch was found; otherwise sleep for pollIntervalMs
+        if (processedCount < BATCH_SIZE) {
+          await this.sleep(this.pollIntervalMs);
+        }
+      } catch (err) {
+        console.error('[OutboxWorker] Unexpected relay loop error:', err);
+        await this.sleep(this.pollIntervalMs * 2);
+      }
+    }
+  }
+
+  /**
+   * Claims and publishes a batch of pending outbox events inside a single DB transaction.
+   */
+  public async processBatch(): Promise<number> {
+    const client = await this.db.connect();
+
+    try {
+      await client.query('BEGIN');
+
+      // SKIP LOCKED allows multiple worker pods to process concurrent batches lock-free
+      const { rows } = await client.query<OutboxRecord>(
+        `
+        SELECT id, aggregate_id, event_type, payload, retry_count, created_at
+        FROM outbox_events
+        WHERE status = 'PENDING'
+          AND (next_attempt_at IS NULL OR next_attempt_at  Promise<unknown> },
+    event: OutboxRecord,
+    err: unknown
+  ): Promise<void> {
+    const nextRetry = event.retry_count + 1;
+    const errorMessage = err instanceof Error ? err.message : 'Unknown broker error';
+
+    if (nextRetry > MAX_RETRIES) {
+      // Isolate poison-pill messages so they do not stall healthy queue throughput
+      await client.query(
+        `
+        UPDATE outbox_events
+        SET status = 'DEAD_LETTER', last_error = $2
+        WHERE id = $1
+        `,
+        [event.id, errorMessage]
+      );
+      return;
+    }
+
+    // Exponential backoff with full jitter to prevent broker stampedes on recovery
+    const exponentialMs = BASE_BACKOFF_MS * Math.pow(2, nextRetry);
+    const jitteredDelayMs = Math.floor(Math.random() * exponentialMs);
+
+    await client.query(
+      `
+      UPDATE outbox_events
+      SET retry_count = $2,
+          next_attempt_at = NOW() + ($3 || ' milliseconds')::INTERVAL,
+          last_error = $4
+      WHERE id = $1
+      `,
+      [event.id, nextRetry, jitteredDelayMs, errorMessage]
+    );
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}
