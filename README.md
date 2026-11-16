@@ -11,6 +11,9 @@ A reference cloud-native gateway engineered to ingest high-concurrency offline m
 ```bash
 docker-compose up --build
 ```
+# Run thundering-herd simulation against local Docker cluster
+k6 run load-tests/thundering-herd.js
+
 
 ## Architecture Documentation
 * [ADR-001: Distributed Idempotency Strategy](./docs/ADR-001-idempotency.md)
